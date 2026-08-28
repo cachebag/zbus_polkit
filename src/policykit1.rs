@@ -193,7 +193,7 @@ impl Subject {
         let mut hashmap = HashMap::new();
         hashmap.insert("pid".to_string(), pid.into());
         hashmap.insert("start-time".to_string(), start_time.into());
-        hashmap.insert("uid".to_string(), uid.into());
+        hashmap.insert("uid".to_string(), (uid as i32).into());
 
         Ok(Self {
             subject_kind: "unix-process".into(),
