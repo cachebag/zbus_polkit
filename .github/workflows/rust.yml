@@ -1,5 +1,4 @@
-# Run `cargo test` on windwos, linux and mac
-name: CI
+name: Lint, Build and Test
 
 on:
   push:
@@ -8,62 +7,108 @@ on:
     branches: [main]
 
 jobs:
-  test:
+  MSRV:
+    runs-on: ubuntu-latest
     env:
-      RUST_LOG: "trace"
-      RUST_BACKTRACE: "full"
       RUSTFLAGS: -D warnings
+      MSRV: 1.87.0
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.MSRV }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Check build with MSRV
+        run: |
+          cargo --locked check
+          cargo --locked check --no-default-features --features tokio
+          cargo --locked check --all-features
+
+  fmt:
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          # We use some nightly fmt options.
+          toolchain: nightly
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Check formatting
+        run: cargo --locked fmt --all -- --check
+
+  clippy:
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Catch common mistakes
+        run: |
+          cargo --locked clippy --all-targets
+          cargo --locked clippy --all-targets --no-default-features --features tokio
+          cargo --locked clippy --all-targets --all-features
+
+  test:
     runs-on: ubuntu-latest
     needs: [fmt, clippy]
+    env:
+      RUSTFLAGS: -D warnings
+      RUST_BACKTRACE: full
+      RUST_LOG: trace
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@v2
-      - name: Run tests on stable Rust
-        run: cargo test
+      - name: Test default features (async-io + blocking-api)
+        run: cargo --locked test
+      - name: Test tokio without blocking-api
+        run: cargo --locked test --no-default-features --features tokio
+      - name: Test all features (async-io + tokio + blocking-api)
+        run: cargo --locked test --all-features
 
   test_nightly:
-    env:
-      RUST_LOG: "trace"
-      RUST_BACKTRACE: "full"
-      RUSTFLAGS: -D warnings
     runs-on: ubuntu-latest
     needs: [fmt, clippy]
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: nightly
-      - uses: Swatinem/rust-cache@v2
-      - name: Run tests on nightly Rust
-        run: cargo test
-
-  fmt:
     env:
       RUSTFLAGS: -D warnings
-    runs-on: ubuntu-latest
+      RUST_BACKTRACE: full
+      RUST_LOG: trace
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: nightly
-          components: rustfmt
       - uses: Swatinem/rust-cache@v2
-      - name: Check formatting
-        run: cargo fmt --all -- --check
+      - name: Test on nightly Rust
+        run: cargo --locked test --all-features
 
-  clippy:
-    env:
-      RUSTFLAGS: -D warnings
+  doc_build:
     runs-on: ubuntu-latest
+    env:
+      RUSTDOCFLAGS: -D warnings
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly
-          components: clippy
+          toolchain: stable
       - uses: Swatinem/rust-cache@v2
-      - name: Check common mistakes
-        run: cargo clippy --all
+      - name: Check documentation build
+        run: cargo --locked doc --all-features --no-deps
+
+  semver-checks:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Check semver
+        uses: obi1kenobi/cargo-semver-checks-action@v2
