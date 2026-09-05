@@ -411,8 +411,9 @@ pub trait Authority {
     ) -> zbus::Result<()>;
 
     /// Like `RegisterAuthenticationAgent` but takes additional options. If the option fallback (of
-    /// type Boolean) is TRUE, then the authentcation agent will only be used as a fallback, e.g. if
-    /// another agent (without the fallback option set TRUE) is available, it will be used instead.
+    /// type Boolean) is TRUE, then the authentication agent will only be used as a fallback, e.g.
+    /// if another agent (without the fallback option set TRUE) is available, it will be used
+    /// instead.
     fn register_authentication_agent_with_options(
         &self,
         subject: &Subject,
