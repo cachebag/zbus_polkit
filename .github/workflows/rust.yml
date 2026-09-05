@@ -7,6 +7,23 @@ on:
     branches: [main]
 
 jobs:
+  MSRV:
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: -D warnings
+      MSRV: 1.87.0
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.MSRV }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Check build with MSRV
+        run: |
+          cargo --locked check
+          cargo --locked check --no-default-features --features tokio
+          cargo --locked check --all-features
+
   fmt:
     runs-on: ubuntu-latest
     env:
