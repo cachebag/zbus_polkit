@@ -81,7 +81,16 @@ cases, it's acceptable to tell clippy to [ignore the specific error or warning i
 code][clippy-allow].
 
 If you intend to contribute often or think that's very likely, we recommend installing the commit
-hook provided by [`gimoji`][gimoji].
+hook provided by [`gimoji`][gimoji], as well as the git hook scripts contained within this
+repository, which run `rustfmt` before each commit and `clippy` before each push. You can enable
+them with:
+
+```sh
+cp .githooks/* .git/hooks/
+```
+
+The two do not conflict: `gimoji` installs a `prepare-commit-msg` hook, while the scripts here are
+`pre-commit` and `pre-push` hooks.
 
 ## Conduct
 
