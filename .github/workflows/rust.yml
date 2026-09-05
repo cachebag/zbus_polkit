@@ -69,8 +69,12 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@v2
-      - name: Test on stable Rust
+      - name: Test default features (async-io + blocking-api)
         run: cargo --locked test
+      - name: Test tokio without blocking-api
+        run: cargo --locked test --no-default-features --features tokio
+      - name: Test all features (async-io + tokio + blocking-api)
+        run: cargo --locked test --all-features
 
   test_nightly:
     runs-on: ubuntu-latest
@@ -86,4 +90,4 @@ jobs:
           toolchain: nightly
       - uses: Swatinem/rust-cache@v2
       - name: Test on nightly Rust
-        run: cargo --locked test
+        run: cargo --locked test --all-features
