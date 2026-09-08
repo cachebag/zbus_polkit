@@ -471,3 +471,116 @@ pub trait Authority {
 assert_impl_all!(AuthorityProxy<'_>: Send, Sync, Unpin);
 #[cfg(feature = "blocking-api")]
 assert_impl_all!(AuthorityProxyBlocking<'_>: Send, Sync, Unpin);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn subject_for_owner_uses_polkit_wire_types() {
+        let subject = Subject::new_for_owner(4242, Some(1_000_000), Some(1234)).unwrap();
+
+        assert_eq!(subject.subject_kind, "unix-process");
+        assert_eq!(subject.subject_details.len(), 3);
+        assert_eq!(*subject.subject_details["pid"], Value::U32(4242));
+        assert_eq!(
+            *subject.subject_details["start-time"],
+            Value::U64(1_000_000)
+        );
+        // polkit reads `uid` as a signed 32-bit integer. Sent as any other type it is silently
+        // ignored and polkit falls back to its own racy /proc lookup, which defeats the purpose
+        // of passing a UID obtained from a trusted source (see #101).
+        assert_eq!(*subject.subject_details["uid"], Value::I32(1234));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn subject_for_owner_looks_up_the_process_in_proc() {
+        use std::os::unix::fs::MetadataExt;
+
+        let pid = std::process::id();
+        let subject = Subject::new_for_owner(pid, None, None).unwrap();
+
+        // /proc/<pid> is owned by the process's UID, which gives us an independent source of
+        // truth that doesn't go through the parser under test.
+        let uid = std::fs::metadata("/proc/self").unwrap().uid();
+        let stat = std::fs::read_to_string("/proc/self/stat").unwrap();
+        let start_time = parse_start_time(&stat).unwrap();
+
+        assert_eq!(*subject.subject_details["pid"], Value::U32(pid));
+        assert_eq!(*subject.subject_details["uid"], Value::I32(uid as i32));
+        assert_eq!(
+            *subject.subject_details["start-time"],
+            Value::U64(start_time)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn subject_for_owner_fails_for_a_missing_process() {
+        // pid_max is capped at 2^22 on Linux, so this PID can never exist.
+        let err = Subject::new_for_owner(u32::MAX, None, None).unwrap_err();
+        assert!(matches!(err, Error::Io(_)), "{err:?}");
+    }
+
+    #[test]
+    fn start_time_is_field_22_counted_from_the_last_paren() {
+        // proc(5): pid, (comm), state, ppid, pgrp, session, tty_nr, tpgid, flags, minflt,
+        // cminflt, majflt, cmajflt, utime, stime, cutime, cstime, priority, nice, num_threads,
+        // itrealvalue, starttime, vsize, rss, ...
+        let stat = "1 (systemd) S 0 1 1 0 -1 4194560 100 0 0 0 5 3 0 0 20 0 1 0 42 12345678 100\n";
+        assert_eq!(parse_start_time(stat).unwrap(), 42);
+
+        // `comm` is not escaped, so a process name containing spaces and parentheses shifts
+        // every naive field count. Counting from the last `)` is what makes this work.
+        let stat = "1234 (my (weird) proc) S 1 1234 1234 0 -1 4194560 100 0 0 0 5 3 0 0 20 0 1 \
+                    0 987654 12345678 100\n";
+        assert_eq!(parse_start_time(stat).unwrap(), 987654);
+    }
+
+    #[test]
+    fn start_time_rejects_malformed_stat() {
+        assert!(matches!(parse_start_time(""), Err(Error::Io(_))));
+        assert!(matches!(
+            parse_start_time("no parens here"),
+            Err(Error::Io(_))
+        ));
+        // Too few fields after `comm`.
+        assert!(matches!(
+            parse_start_time("1234 (x) S 1 1234"),
+            Err(Error::Io(_))
+        ));
+        // Field 22 present but not a number.
+        let stat = "1 (x) S 0 1 1 0 -1 4194560 100 0 0 0 5 3 0 0 20 0 1 0 forty-two 12345678 100";
+        assert!(matches!(parse_start_time(stat), Err(Error::ParseInt(_))));
+    }
+
+    #[test]
+    fn uid_is_the_real_uid_from_status() {
+        let status = "Name:\tmy proc\n\
+                      Umask:\t0022\n\
+                      State:\tS (sleeping)\n\
+                      Tgid:\t1234\n\
+                      Pid:\t1234\n\
+                      PPid:\t1\n\
+                      TracerPid:\t0\n\
+                      Uid:\t1000\t1001\t1002\t1003\n\
+                      Gid:\t2000\t2001\t2002\t2003\n";
+        // Real UID, not effective (1001) or saved-set (1002).
+        assert_eq!(parse_uid(status).unwrap(), 1000);
+    }
+
+    #[test]
+    fn uid_rejects_malformed_status() {
+        assert!(matches!(parse_uid(""), Err(Error::Io(_))));
+        assert!(matches!(
+            parse_uid("Name:\tx\nGid:\t0\t0\t0\t0\n"),
+            Err(Error::Io(_))
+        ));
+        assert!(matches!(parse_uid("Uid:\n"), Err(Error::Io(_))));
+        assert!(matches!(
+            parse_uid("Uid:\tnobody\n"),
+            Err(Error::ParseInt(_))
+        ));
+    }
+}
