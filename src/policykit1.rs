@@ -474,6 +474,8 @@ assert_impl_all!(AuthorityProxyBlocking<'_>: Send, Sync, Unpin);
 
 #[cfg(test)]
 mod tests {
+    use zbus::zvariant::{serialized::Context, to_bytes, LE};
+
     use super::*;
 
     #[test]
@@ -582,5 +584,51 @@ mod tests {
             parse_uid("Uid:\tnobody\n"),
             Err(Error::ParseInt(_))
         ));
+    }
+
+    // Signatures as documented in the polkit D-Bus API reference:
+    // https://polkit.pages.freedesktop.org/polkit/eggdbus-interface-org.freedesktop.PolicyKit1.Authority.html
+    #[test]
+    fn wire_signatures_match_polkit() {
+        assert_eq!(Subject::SIGNATURE.to_string(), "(sa{sv})");
+        assert_eq!(<Identity<'_>>::SIGNATURE.to_string(), "(sa{sv})");
+        assert_eq!(
+            TemporaryAuthorization::SIGNATURE.to_string(),
+            "(ss(sa{sv})tt)"
+        );
+        assert_eq!(ActionDescription::SIGNATURE.to_string(), "(ssssssuuua{ss})");
+        assert_eq!(AuthorizationResult::SIGNATURE.to_string(), "(bba{ss})");
+
+        assert_eq!(CheckAuthorizationFlags::SIGNATURE.to_string(), "u");
+        assert_eq!(
+            BitFlags::<CheckAuthorizationFlags>::SIGNATURE.to_string(),
+            "u"
+        );
+        assert_eq!(ImplicitAuthorization::SIGNATURE.to_string(), "u");
+        assert_eq!(AuthorityFeatures::SIGNATURE.to_string(), "u");
+    }
+
+    #[test]
+    fn enums_serialize_as_their_u32_discriminant() {
+        let ctxt = Context::new_dbus(LE, 0);
+
+        let encoded = to_bytes(ctxt, &ImplicitAuthorization::Authorized).unwrap();
+        assert_eq!(encoded.bytes(), 5u32.to_le_bytes());
+        let (decoded, _) = encoded.deserialize::<ImplicitAuthorization>().unwrap();
+        assert_eq!(decoded, ImplicitAuthorization::Authorized);
+
+        let flags: BitFlags<CheckAuthorizationFlags> =
+            CheckAuthorizationFlags::AllowUserInteraction.into();
+        let encoded = to_bytes(ctxt, &flags).unwrap();
+        assert_eq!(encoded.bytes(), 1u32.to_le_bytes());
+    }
+
+    #[test]
+    fn authority_features_from_value() {
+        let features = AuthorityFeatures::try_from(OwnedValue::from(1u32)).unwrap();
+        assert_eq!(features, AuthorityFeatures::TemporaryAuthorization);
+
+        let not_a_u32 = OwnedValue::try_from(Value::Str("nope".into())).unwrap();
+        assert!(AuthorityFeatures::try_from(not_a_u32).is_err());
     }
 }
