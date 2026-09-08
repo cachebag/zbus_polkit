@@ -1,4 +1,4 @@
-use std::{collections::HashMap, io::BufRead};
+use std::collections::HashMap;
 
 use enumflags2::{bitflags, BitFlags};
 use serde::{Deserialize, Serialize};
@@ -110,37 +110,6 @@ pub struct Identity<'a> {
 
 assert_impl_all!(Identity<'_>: Send, Sync, Unpin);
 
-fn pid_start_time(pid: u32) -> Result<u64, Error> {
-    let fname = format!("/proc/{pid}/stat");
-    let content = std::fs::read_to_string(fname)?;
-
-    if let Some(i) = content.rfind(')') {
-        if let Some(start_time) = content[i..].split(' ').nth(20) {
-            return Ok(start_time.parse()?);
-        }
-    }
-
-    Err(std::io::Error::from(std::io::ErrorKind::NotFound).into())
-}
-
-// Return the "current" UID.  Note that this is inherently racy, and the value may already be
-// obsolete by the time this function returns; this function only guarantees that the UID was valid
-// at some point during its execution.
-fn pid_uid_racy(pid: u32) -> Result<u32, Error> {
-    let fname = format!("/proc/{pid}/status");
-    let file = std::fs::File::open(fname)?;
-    let lines = std::io::BufReader::new(file).lines();
-    for line in lines.map_while(Result::ok) {
-        if line.starts_with("Uid:") {
-            if let Some(uid) = line.split('\t').nth(1) {
-                return Ok(uid.parse()?);
-            }
-        }
-    }
-
-    Err(std::io::Error::from(std::io::ErrorKind::NotFound).into())
-}
-
 /// This struct describes subjects such as UNIX processes. It is typically used to check if a given
 /// process is authorized for an action.
 ///
@@ -229,6 +198,47 @@ impl Subject {
             subject_details,
         })
     }
+}
+
+fn pid_start_time(pid: u32) -> Result<u64, Error> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))?;
+    parse_start_time(&stat)
+}
+
+// Extract the process start time (field 22 of proc(5) `stat`, in clock ticks since boot).
+//
+// The second field, `comm`, is the executable name wrapped in parentheses and may itself contain
+// spaces and parentheses, so fields are counted from the *last* closing parenthesis rather than
+// from the start of the line.
+fn parse_start_time(stat: &str) -> Result<u64, Error> {
+    let start_time = stat
+        .rfind(')')
+        .and_then(|i| stat[i..].split(' ').nth(20))
+        .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))?;
+
+    Ok(start_time.parse()?)
+}
+
+// Return the "current" UID.  Note that this is inherently racy, and the value may already be
+// obsolete by the time this function returns; this function only guarantees that the UID was valid
+// at some point during its execution.
+fn pid_uid_racy(pid: u32) -> Result<u32, Error> {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status"))?;
+    parse_uid(&status)
+}
+
+// Extract the real UID from the contents of proc(5) `status`.
+//
+// The `Uid:` line lists the real, effective, saved set and filesystem UIDs; only the first one is
+// returned, since that is what polkit expects in a `unix-process` subject.
+fn parse_uid(status: &str) -> Result<u32, Error> {
+    let uid = status
+        .lines()
+        .find_map(|line| line.strip_prefix("Uid:"))
+        .and_then(|uids| uids.split_whitespace().next())
+        .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))?;
+
+    Ok(uid.parse()?)
 }
 
 /// This struct describes actions registered with the PolicyKit daemon.
