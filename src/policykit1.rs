@@ -474,7 +474,10 @@ assert_impl_all!(AuthorityProxyBlocking<'_>: Send, Sync, Unpin);
 
 #[cfg(test)]
 mod tests {
-    use zbus::zvariant::{serialized::Context, to_bytes, LE};
+    use zbus::{
+        message::Message,
+        zvariant::{serialized::Context, to_bytes, LE},
+    };
 
     use super::*;
 
@@ -630,5 +633,32 @@ mod tests {
 
         let not_a_u32 = OwnedValue::try_from(Value::Str("nope".into())).unwrap();
         assert!(AuthorityFeatures::try_from(not_a_u32).is_err());
+    }
+
+    #[test]
+    fn subject_for_message_header_uses_the_sender_bus_name() {
+        let msg = Message::method_call("/org/example/Object", "Frobnicate")
+            .unwrap()
+            .sender(":1.42")
+            .unwrap()
+            .build(&())
+            .unwrap();
+
+        let subject = Subject::new_for_message_header(&msg.header()).unwrap();
+
+        assert_eq!(subject.subject_kind, "system-bus-name");
+        assert_eq!(subject.subject_details.len(), 1);
+        assert_eq!(*subject.subject_details["name"], Value::Str(":1.42".into()));
+    }
+
+    #[test]
+    fn subject_for_message_header_requires_a_sender() {
+        let msg = Message::method_call("/org/example/Object", "Frobnicate")
+            .unwrap()
+            .build(&())
+            .unwrap();
+
+        let err = Subject::new_for_message_header(&msg.header()).unwrap_err();
+        assert!(matches!(err, Error::MissingSender), "{err:?}");
     }
 }
