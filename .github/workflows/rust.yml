@@ -63,18 +63,39 @@ jobs:
       RUSTFLAGS: -D warnings
       RUST_BACKTRACE: full
       RUST_LOG: trace
+      # Fail instead of quietly falling back to the in-process mock, so this job really does
+      # exercise the daemon installed below.
+      ZBUS_POLKIT_REQUIRE_REAL: 1
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@v2
+      - name: Install polkit
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y polkitd
+          # `changed_signal` drops a rules file in here to make the daemon reload and announce it,
+          # so it has to belong to the user the tests run as, and it has to be there before the
+          # daemon starts watching it. Handing a system directory to an unprivileged user is only
+          # alright because this machine is thrown away with the job.
+          sudo install -d -o "$(id -u)" -g "$(id -g)" /etc/polkit-1/rules.d
+          sudo systemctl start polkit.service
       - name: Test default features (async-io + blocking-api)
         run: cargo --locked test
       - name: Test tokio without blocking-api
         run: cargo --locked test --no-default-features --features tokio
       - name: Test all features (async-io + tokio + blocking-api)
         run: cargo --locked test --all-features
+      - name: Test against the mock Authority
+        # For the two assertions this harness cannot make against the daemon: the `uid` type it
+        # reads off the wire, which only the mock reports back, and a granted temporary
+        # authorization, which the daemon does issue, but only to a session with an authentication
+        # agent, and this job sets up neither.
+        run: cargo --locked test --all-features --test authority
+        env:
+          ZBUS_POLKIT_MOCK: 1
 
   test_nightly:
     runs-on: ubuntu-latest
@@ -83,12 +104,25 @@ jobs:
       RUSTFLAGS: -D warnings
       RUST_BACKTRACE: full
       RUST_LOG: trace
+      # Fail instead of quietly falling back to the in-process mock, so this job really does
+      # exercise the daemon installed below.
+      ZBUS_POLKIT_REQUIRE_REAL: 1
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: nightly
       - uses: Swatinem/rust-cache@v2
+      - name: Install polkit
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y polkitd
+          # `changed_signal` drops a rules file in here to make the daemon reload and announce it,
+          # so it has to belong to the user the tests run as, and it has to be there before the
+          # daemon starts watching it. Handing a system directory to an unprivileged user is only
+          # alright because this machine is thrown away with the job.
+          sudo install -d -o "$(id -u)" -g "$(id -g)" /etc/polkit-1/rules.d
+          sudo systemctl start polkit.service
       - name: Test on nightly Rust
         run: cargo --locked test --all-features
 
