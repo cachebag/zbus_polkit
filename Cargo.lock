@@ -788,6 +788,7 @@ dependencies = [
  "byteorder",
  "enumflags2",
  "futures-util",
+ "rustix",
  "serde",
  "serde_json",
  "serde_repr",
