@@ -1,10 +1,20 @@
-use std::collections::HashMap;
+use std::{borrow::Cow, collections::HashMap, os::fd::AsFd};
 
 use enumflags2::{bitflags, BitFlags};
-use serde::{Deserialize, Serialize};
+use serde::{
+    de::{
+        self,
+        value::{MapDeserializer, SeqDeserializer},
+        IgnoredAny, IntoDeserializer, MapAccess, SeqAccess, Visitor,
+    },
+    ser::SerializeStruct,
+    Deserialize, Deserializer, Serialize, Serializer,
+};
 use serde_repr::{Deserialize_repr, Serialize_repr};
 use static_assertions::assert_impl_all;
-use zbus::{fdo, names::OwnedUniqueName, OwnedValue, Type, Value};
+use zbus::{
+    fdo, names::OwnedUniqueName, DeserializeDict, OwnedFd, OwnedValue, SerializeDict, Type, Value,
+};
 
 use crate::Error;
 
@@ -97,33 +107,130 @@ pub struct Identity<'a> {
 
 assert_impl_all!(Identity<'_>: Send, Sync, Unpin);
 
-/// This struct describes subjects such as UNIX processes. It is typically used to check if a given
+/// This enum describes subjects such as UNIX processes. It is typically used to check if a given
 /// process is authorized for an action.
 ///
-/// The following kinds of subjects are known:
-///
-/// * Unix Process. `subject_kind` should be set to `unix-process` with keys `pid` (of type
-///   `uint32`) and `start-time` (of type `uint64`).
-///
-/// * Unix Session. `subject_kind` should be set to `unix-session` with the key `session-id` (of
-///   type `string`).
-///
-/// * System Bus Name. `subject_kind` should be set to `system-bus-name` with the key `name` (of
-///   type `string`).
-#[derive(Debug, Type, Serialize, Deserialize)]
-pub struct Subject {
-    /// The type of the subject.
-    pub subject_kind: String,
+/// On the wire a subject is a kind string and a dictionary of details whose contents depend on that
+/// kind. Each kind polkit documents has its details spelled out as a struct here; anything else
+/// arrives as [`Subject::Other`].
+#[derive(Debug, Type)]
+#[zbus(signature = "(sa{sv})")]
+#[non_exhaustive]
+pub enum Subject {
+    /// A UNIX process, sent as `unix-process`.
+    UnixProcess(UnixProcess),
 
-    /// Details about the subject. Depending of the value of `subject_kind`, a set of well-defined
-    /// key/value pairs are guaranteed to be available.
-    pub subject_details: HashMap<String, OwnedValue>,
+    /// A login session, sent as `unix-session`.
+    UnixSession(UnixSession),
+
+    /// The owner of a name on the bus, sent as `system-bus-name`.
+    SystemBusName(SystemBusName),
+
+    /// A kind of subject this crate does not know about, left as it came off the wire.
+    Other {
+        /// The kind the authority named.
+        kind: String,
+
+        /// The details, undecoded.
+        details: HashMap<String, OwnedValue>,
+    },
 }
 
 assert_impl_all!(Subject: Send, Sync, Unpin);
 
+/// The details of a [`Subject::UnixProcess`].
+///
+/// polkit accepts a process in two forms, and looks up whatever it is not given in `/proc`:
+///
+/// * a `pidfd` and a `uid`, which is what [`Subject::new_for_owner`] sends, or
+///
+/// * a `pid`, a `start-time` and a `uid`, which is what [`Subject::new_for_pid`] sends.
+#[derive(Debug, Default, SerializeDict, DeserializeDict, Type)]
+#[zbus(signature = "a{sv}")]
+pub struct UnixProcess {
+    /// A pidfd naming one specific incarnation of the process.
+    ///
+    /// polkit only trusts this when `uid` is sent with it, and then reads the process from it
+    /// rather than from `pid` and `start_time`.
+    pub pidfd: Option<OwnedFd>,
+
+    /// The process ID.
+    ///
+    /// A PID can be reused once the process it named exits, so `start_time` is what makes this
+    /// name specific.
+    pub pid: Option<u32>,
+
+    /// The start time of `pid`, in clock ticks since boot, as in field 22 of `/proc/<pid>/stat`.
+    #[zbus(rename = "start-time")]
+    pub start_time: Option<u64>,
+
+    /// The (real, not effective) uid of the owner of the process.
+    ///
+    /// polkit reads this as a *signed* 32-bit integer, which is why this is an `i32` and not a
+    /// `u32`. Sent as any other type it is silently ignored and polkit falls back to its own racy
+    /// `/proc` lookup.
+    pub uid: Option<i32>,
+}
+
+assert_impl_all!(UnixProcess: Send, Sync, Unpin);
+
+/// The details of a [`Subject::UnixSession`].
+#[derive(Debug, SerializeDict, DeserializeDict, Type)]
+#[zbus(signature = "a{sv}")]
+pub struct UnixSession {
+    /// The identifier of the session, as the login manager knows it.
+    #[zbus(rename = "session-id")]
+    pub session_id: String,
+}
+
+assert_impl_all!(UnixSession: Send, Sync, Unpin);
+
+/// The details of a [`Subject::SystemBusName`].
+#[derive(Debug, SerializeDict, DeserializeDict, Type)]
+#[zbus(signature = "a{sv}")]
+pub struct SystemBusName {
+    /// The unique name of the connection that owns the subject.
+    pub name: OwnedUniqueName,
+}
+
+assert_impl_all!(SystemBusName: Send, Sync, Unpin);
+
 impl Subject {
+    /// The kind this subject is sent as.
+    pub fn kind(&self) -> &str {
+        match self {
+            Self::UnixProcess(_) => UNIX_PROCESS,
+            Self::UnixSession(_) => UNIX_SESSION,
+            Self::SystemBusName(_) => SYSTEM_BUS_NAME,
+            Self::Other { kind, .. } => kind,
+        }
+    }
+
+    /// Create a `Subject` for a process identified by `pidfd`.
+    ///
+    /// A pidfd names a specific process incarnation, so this is not subject to the PID-reuse
+    /// race that [`new_for_pid`](Self::new_for_pid) is. Polkit requires `uid` to be sent
+    /// together with a pidfd and will not look it up itself; obtain both from a trusted source
+    /// at the same time (e.g. `SO_PEERPIDFD` and `SO_PEERCRED`, or `pidfd_open` and a known
+    /// uid).
+    ///
+    /// # Arguments
+    ///
+    /// * `pidfd` - A pidfd for the process (from `pidfd_open(2)` or `SO_PEERPIDFD`)
+    ///
+    /// * `uid` - The (real, not effective) uid of the owner of the process
+    pub fn new_for_owner(pidfd: impl AsFd, uid: u32) -> Result<Self, Error> {
+        Ok(Self::UnixProcess(UnixProcess {
+            pidfd: Some(pidfd.as_fd().try_clone_to_owned()?.into()),
+            uid: Some(uid as i32),
+            ..Default::default()
+        }))
+    }
+
     /// Create a `Subject` for `pid`, `start_time` & `uid`.
+    ///
+    /// A PID can be reused after the original process exits, so this form is racy. Prefer
+    /// [`new_for_owner`](Self::new_for_owner) when the kernel and polkit support pidfds.
     ///
     /// # Arguments
     ///
@@ -133,11 +240,7 @@ impl Subject {
     ///
     /// * `uid` - The (real, not effective) uid of the owner of `pid` or `None` to look it up in
     ///   e.g. `/proc`
-    pub fn new_for_owner(
-        pid: u32,
-        start_time: Option<u64>,
-        uid: Option<u32>,
-    ) -> Result<Self, Error> {
+    pub fn new_for_pid(pid: u32, start_time: Option<u64>, uid: Option<u32>) -> Result<Self, Error> {
         let start_time = match start_time {
             Some(s) => s,
             None => pid_start_time(pid)?,
@@ -146,15 +249,13 @@ impl Subject {
             Some(u) => u,
             None => pid_uid_racy(pid)?,
         };
-        let mut hashmap = HashMap::new();
-        hashmap.insert("pid".to_string(), pid.into());
-        hashmap.insert("start-time".to_string(), start_time.into());
-        hashmap.insert("uid".to_string(), (uid as i32).into());
 
-        Ok(Self {
-            subject_kind: "unix-process".into(),
-            subject_details: hashmap,
-        })
+        Ok(Self::UnixProcess(UnixProcess {
+            pid: Some(pid),
+            start_time: Some(start_time),
+            uid: Some(uid as i32),
+            pidfd: None,
+        }))
     }
 
     /// Create a `Subject` for a message for querying if the sender of a Message is permitted to
@@ -167,25 +268,285 @@ impl Subject {
     pub fn new_for_message_header(
         message_header: &zbus::message::Header<'_>,
     ) -> Result<Self, Error> {
-        let mut subject_details = HashMap::new();
-        match message_header.sender() {
-            Some(sender) => {
-                subject_details.insert(
-                    "name".to_string(),
-                    OwnedUniqueName::from(sender.clone()).try_into().unwrap(),
-                );
-            }
-            None => {
-                return Err(Error::MissingSender);
+        let sender = message_header.sender().ok_or(Error::MissingSender)?;
+
+        Ok(Self::SystemBusName(SystemBusName {
+            name: OwnedUniqueName::from(sender.clone()),
+        }))
+    }
+}
+
+impl Serialize for Subject {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut subject = serializer.serialize_struct("Subject", 2)?;
+        subject.serialize_field(SUBJECT_KIND, self.kind())?;
+        match self {
+            Self::UnixProcess(details) => subject.serialize_field(SUBJECT_DETAILS, details)?,
+            Self::UnixSession(details) => subject.serialize_field(SUBJECT_DETAILS, details)?,
+            Self::SystemBusName(details) => subject.serialize_field(SUBJECT_DETAILS, details)?,
+            Self::Other { details, .. } => subject.serialize_field(SUBJECT_DETAILS, details)?,
+        }
+
+        subject.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for Subject {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_struct("Subject", SUBJECT_FIELDS, SubjectVisitor)
+    }
+}
+
+struct SubjectVisitor;
+
+impl<'de> Visitor<'de> for SubjectVisitor {
+    type Value = Subject;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("a subject kind and the details for that kind")
+    }
+
+    // Which type the details decode as is only known once the kind has been read, which is why
+    // this is written out rather than derived.
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Subject, A::Error> {
+        let kind: String = seq
+            .next_element()?
+            .ok_or_else(|| de::Error::invalid_length(0, &self))?;
+        fn details<'de, T: Deserialize<'de>, A: SeqAccess<'de>>(
+            seq: &mut A,
+        ) -> Result<T, A::Error> {
+            seq.next_element()?
+                .ok_or_else(|| de::Error::invalid_length(1, &"the details of the subject"))
+        }
+
+        Ok(match kind.as_str() {
+            UNIX_PROCESS => Subject::UnixProcess(details(&mut seq)?),
+            UNIX_SESSION => Subject::UnixSession(details(&mut seq)?),
+            SYSTEM_BUS_NAME => Subject::SystemBusName(details(&mut seq)?),
+            _ => Subject::Other {
+                kind,
+                details: details(&mut seq)?,
+            },
+        })
+    }
+
+    // D-Bus hands the fields over as a sequence, but a self-describing format hands them over as a
+    // map, and not necessarily in the order `Serialize` wrote them: `serde_json::to_value`, for
+    // one, sorts keys, which puts the details before the kind. The kind is what says which type
+    // the details decode as, so they are kept as they arrived until it has turned up.
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Subject, A::Error> {
+        let mut kind: Option<String> = None;
+        let mut details: Option<Buffered<'de>> = None;
+
+        while let Some(field) = map.next_key::<String>()? {
+            match field.as_str() {
+                SUBJECT_KIND => {
+                    if kind.replace(map.next_value()?).is_some() {
+                        return Err(de::Error::duplicate_field(SUBJECT_KIND));
+                    }
+                }
+                SUBJECT_DETAILS => {
+                    if details.replace(map.next_value()?).is_some() {
+                        return Err(de::Error::duplicate_field(SUBJECT_DETAILS));
+                    }
+                }
+                _ => {
+                    map.next_value::<IgnoredAny>()?;
+                }
             }
         }
 
-        Ok(Self {
-            subject_kind: "system-bus-name".to_string(),
-            subject_details,
+        let kind = kind.ok_or_else(|| de::Error::missing_field(SUBJECT_KIND))?;
+        let details = details.ok_or_else(|| de::Error::missing_field(SUBJECT_DETAILS))?;
+        fn decode<'de, T: Deserialize<'de>, E: de::Error>(details: Buffered<'de>) -> Result<T, E> {
+            T::deserialize(details).map_err(E::custom)
+        }
+
+        Ok(match kind.as_str() {
+            UNIX_PROCESS => Subject::UnixProcess(decode(details)?),
+            UNIX_SESSION => Subject::UnixSession(decode(details)?),
+            SYSTEM_BUS_NAME => Subject::SystemBusName(decode(details)?),
+            _ => Subject::Other {
+                kind,
+                details: decode(details)?,
+            },
         })
     }
 }
+
+/// A value kept exactly as a self-describing format handed it over, for when what it has to
+/// decode as is not known until later.
+///
+/// Only the map path of [`SubjectVisitor`] needs this, for details that arrive before their kind.
+/// Borrowed strings and bytes stay borrowed: an unknown kind's details decode as [`OwnedValue`],
+/// whose signature still deserializes only from a borrowed string, so replaying an owned copy
+/// would not do. (A known kind's typed details go through zbus's `as_value`, which takes either.)
+/// Numbers keep the widest form the format offered, which is the form serde's own integer visitors
+/// narrow from.
+enum Buffered<'de> {
+    Bool(bool),
+    Signed(i64),
+    Unsigned(u64),
+    Float(f64),
+    Str(Cow<'de, str>),
+    Bytes(Cow<'de, [u8]>),
+    Unit,
+    None,
+    Some(Box<Buffered<'de>>),
+    Seq(Vec<Buffered<'de>>),
+    Map(Vec<(Buffered<'de>, Buffered<'de>)>),
+}
+
+impl<'de> Deserialize<'de> for Buffered<'de> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_any(BufferedVisitor)
+    }
+}
+
+struct BufferedVisitor;
+
+impl<'de> Visitor<'de> for BufferedVisitor {
+    type Value = Buffered<'de>;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("any value")
+    }
+
+    fn visit_bool<E: de::Error>(self, v: bool) -> Result<Self::Value, E> {
+        Ok(Buffered::Bool(v))
+    }
+
+    fn visit_i64<E: de::Error>(self, v: i64) -> Result<Self::Value, E> {
+        Ok(Buffered::Signed(v))
+    }
+
+    fn visit_u64<E: de::Error>(self, v: u64) -> Result<Self::Value, E> {
+        Ok(Buffered::Unsigned(v))
+    }
+
+    fn visit_f64<E: de::Error>(self, v: f64) -> Result<Self::Value, E> {
+        Ok(Buffered::Float(v))
+    }
+
+    fn visit_borrowed_str<E: de::Error>(self, v: &'de str) -> Result<Self::Value, E> {
+        Ok(Buffered::Str(Cow::Borrowed(v)))
+    }
+
+    fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
+        Ok(Buffered::Str(Cow::Owned(v.to_owned())))
+    }
+
+    fn visit_string<E: de::Error>(self, v: String) -> Result<Self::Value, E> {
+        Ok(Buffered::Str(Cow::Owned(v)))
+    }
+
+    fn visit_borrowed_bytes<E: de::Error>(self, v: &'de [u8]) -> Result<Self::Value, E> {
+        Ok(Buffered::Bytes(Cow::Borrowed(v)))
+    }
+
+    fn visit_bytes<E: de::Error>(self, v: &[u8]) -> Result<Self::Value, E> {
+        Ok(Buffered::Bytes(Cow::Owned(v.to_vec())))
+    }
+
+    fn visit_byte_buf<E: de::Error>(self, v: Vec<u8>) -> Result<Self::Value, E> {
+        Ok(Buffered::Bytes(Cow::Owned(v)))
+    }
+
+    fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+        Ok(Buffered::Unit)
+    }
+
+    fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
+        Ok(Buffered::None)
+    }
+
+    fn visit_some<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
+        Buffered::deserialize(deserializer).map(|v| Buffered::Some(Box::new(v)))
+    }
+
+    fn visit_newtype_struct<D: Deserializer<'de>>(
+        self,
+        deserializer: D,
+    ) -> Result<Self::Value, D::Error> {
+        Buffered::deserialize(deserializer)
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+        let mut items = Vec::new();
+        while let Some(item) = seq.next_element()? {
+            items.push(item);
+        }
+
+        Ok(Buffered::Seq(items))
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+        let mut entries = Vec::new();
+        while let Some(entry) = map.next_entry()? {
+            entries.push(entry);
+        }
+
+        Ok(Buffered::Map(entries))
+    }
+}
+
+impl<'de> IntoDeserializer<'de, de::value::Error> for Buffered<'de> {
+    type Deserializer = Self;
+
+    fn into_deserializer(self) -> Self {
+        self
+    }
+}
+
+impl<'de> Deserializer<'de> for Buffered<'de> {
+    type Error = de::value::Error;
+
+    fn deserialize_any<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
+        match self {
+            Self::Bool(v) => visitor.visit_bool(v),
+            Self::Signed(v) => visitor.visit_i64(v),
+            Self::Unsigned(v) => visitor.visit_u64(v),
+            Self::Float(v) => visitor.visit_f64(v),
+            Self::Str(Cow::Borrowed(v)) => visitor.visit_borrowed_str(v),
+            Self::Str(Cow::Owned(v)) => visitor.visit_string(v),
+            Self::Bytes(Cow::Borrowed(v)) => visitor.visit_borrowed_bytes(v),
+            Self::Bytes(Cow::Owned(v)) => visitor.visit_byte_buf(v),
+            Self::Unit => visitor.visit_unit(),
+            Self::None => visitor.visit_none(),
+            Self::Some(v) => visitor.visit_some(*v),
+            Self::Seq(v) => visitor.visit_seq(SeqDeserializer::new(v.into_iter())),
+            Self::Map(v) => visitor.visit_map(MapDeserializer::new(v.into_iter())),
+        }
+    }
+
+    fn deserialize_option<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
+        match self {
+            Self::None | Self::Unit => visitor.visit_none(),
+            Self::Some(v) => visitor.visit_some(*v),
+            present => visitor.visit_some(present),
+        }
+    }
+
+    fn deserialize_newtype_struct<V: Visitor<'de>>(
+        self,
+        _name: &'static str,
+        visitor: V,
+    ) -> Result<V::Value, Self::Error> {
+        visitor.visit_newtype_struct(self)
+    }
+
+    serde::forward_to_deserialize_any! {
+        bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string bytes byte_buf unit
+        unit_struct seq tuple tuple_struct map struct enum identifier ignored_any
+    }
+}
+
+const SUBJECT_KIND: &str = "subject_kind";
+const SUBJECT_DETAILS: &str = "subject_details";
+const SUBJECT_FIELDS: &[&str] = &[SUBJECT_KIND, SUBJECT_DETAILS];
+const UNIX_PROCESS: &str = "unix-process";
+const UNIX_SESSION: &str = "unix-session";
+const SYSTEM_BUS_NAME: &str = "system-bus-name";
 
 fn pid_start_time(pid: u32) -> Result<u64, Error> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))?;
@@ -472,30 +833,81 @@ mod tests {
 
     use super::*;
 
-    #[test]
-    fn subject_for_owner_uses_polkit_wire_types() {
-        let subject = Subject::new_for_owner(4242, Some(1_000_000), Some(1234)).unwrap();
+    /// The `(kind, details)` pair `subject` is sent as, read back off the wire.
+    fn sent_as(subject: &Subject) -> (String, HashMap<String, OwnedValue>) {
+        let encoded = to_bytes(Context::new(LE, 0), subject).expect("serialize the subject");
 
-        assert_eq!(subject.subject_kind, "unix-process");
-        assert_eq!(subject.subject_details.len(), 3);
-        assert_eq!(*subject.subject_details["pid"], Value::U32(4242));
-        assert_eq!(
-            *subject.subject_details["start-time"],
-            Value::U64(1_000_000)
-        );
+        encoded
+            .deserialize()
+            .expect("decode the subject as the types polkit reads")
+            .0
+    }
+
+    /// A `Subject` decoded from the `(kind, details)` pair an authority would send.
+    fn received_as<const N: usize>(kind: &str, details: [(&str, Value<'_>); N]) -> Subject {
+        let details: HashMap<String, OwnedValue> = details
+            .into_iter()
+            .map(|(key, value)| (key.to_string(), value.try_into().unwrap()))
+            .collect();
+        let encoded =
+            to_bytes(Context::new(LE, 0), &(kind.to_string(), details)).expect("serialize details");
+
+        encoded.deserialize().expect("decode a subject").0
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn subject_for_owner_sends_pidfd_and_uid() {
+        // What is on the other end of the descriptor does not matter here: `new_for_owner` takes
+        // any `AsFd`, and what is under test is how it is sent, not what polkit makes of it.
+        let pidfd = std::fs::File::open("/dev/null").unwrap();
+        let subject = Subject::new_for_owner(&pidfd, 1234).unwrap();
+
+        let Subject::UnixProcess(details) = &subject else {
+            panic!("expected a unix-process subject, got {subject:?}");
+        };
+        assert!(details.pidfd.is_some());
+        assert_eq!(details.uid, Some(1234));
+        // A pidfd names one incarnation of the process, so polkit needs neither of these, and
+        // ignores them when a pidfd is there.
+        assert_eq!(details.pid, None);
+        assert_eq!(details.start_time, None);
+
+        let (kind, sent) = sent_as(&subject);
+
+        assert_eq!(kind, "unix-process");
+        assert_eq!(sent.len(), 2);
+        // A UNIX_FD ('h'), not a raw i32: polkit looks the handle up in the message's fd list.
+        // Sent as any other type it is ignored and polkit falls back to pid+start-time.
+        assert_eq!(sent["pidfd"].value_signature().to_string(), "h");
+        // polkit refuses a pidfd subject without a uid, and ignores a uid that is not i32.
+        assert_eq!(*sent["uid"], Value::I32(1234));
+    }
+
+    #[test]
+    fn subject_for_pid_uses_polkit_wire_types() {
+        let subject = Subject::new_for_pid(4242, Some(1_000_000), Some(1234)).unwrap();
+        let (kind, sent) = sent_as(&subject);
+
+        assert_eq!(kind, "unix-process");
+        // A pidfd is absent rather than sent as an empty value, so polkit reads the process from
+        // the fields below.
+        assert_eq!(sent.len(), 3);
+        assert_eq!(*sent["pid"], Value::U32(4242));
+        assert_eq!(*sent["start-time"], Value::U64(1_000_000));
         // polkit reads `uid` as a signed 32-bit integer. Sent as any other type it is silently
         // ignored and polkit falls back to its own racy /proc lookup, which defeats the purpose
         // of passing a UID obtained from a trusted source (see #101).
-        assert_eq!(*subject.subject_details["uid"], Value::I32(1234));
+        assert_eq!(*sent["uid"], Value::I32(1234));
     }
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn subject_for_owner_looks_up_the_process_in_proc() {
+    fn subject_for_pid_looks_up_the_process_in_proc() {
         use std::os::unix::fs::MetadataExt;
 
         let pid = std::process::id();
-        let subject = Subject::new_for_owner(pid, None, None).unwrap();
+        let subject = Subject::new_for_pid(pid, None, None).unwrap();
 
         // /proc/<pid> is owned by the process's UID, which gives us an independent source of
         // truth that doesn't go through the parser under test.
@@ -503,19 +915,176 @@ mod tests {
         let stat = std::fs::read_to_string("/proc/self/stat").unwrap();
         let start_time = parse_start_time(&stat).unwrap();
 
-        assert_eq!(*subject.subject_details["pid"], Value::U32(pid));
-        assert_eq!(*subject.subject_details["uid"], Value::I32(uid as i32));
-        assert_eq!(
-            *subject.subject_details["start-time"],
-            Value::U64(start_time)
+        let Subject::UnixProcess(details) = &subject else {
+            panic!("expected a unix-process subject, got {subject:?}");
+        };
+        assert_eq!(details.pid, Some(pid));
+        assert_eq!(details.uid, Some(uid as i32));
+        assert_eq!(details.start_time, Some(start_time));
+    }
+
+    #[test]
+    fn subject_decodes_the_details_of_the_kind_it_was_sent_as() {
+        // What polkit puts in a temporary authorization: no pidfd, and on older versions no uid
+        // either, so a missing key cannot be an error. A key this crate does not know about cannot
+        // be one either, or a future polkit would stop being readable.
+        let process = received_as(
+            "unix-process",
+            [
+                ("pid", Value::U32(4242)),
+                ("start-time", Value::U64(7)),
+                ("something-new", Value::from("ignore me")),
+            ],
         );
+        let Subject::UnixProcess(details) = &process else {
+            panic!("expected a unix-process subject, got {process:?}");
+        };
+        assert_eq!(details.pid, Some(4242));
+        assert_eq!(details.start_time, Some(7));
+        assert_eq!(details.uid, None);
+        assert!(details.pidfd.is_none());
+
+        let session = received_as("unix-session", [("session-id", Value::from("c2"))]);
+        let Subject::UnixSession(details) = &session else {
+            panic!("expected a unix-session subject, got {session:?}");
+        };
+        assert_eq!(details.session_id, "c2");
+
+        let bus_name = received_as("system-bus-name", [("name", Value::from(":1.42"))]);
+        let Subject::SystemBusName(details) = &bus_name else {
+            panic!("expected a system-bus-name subject, got {bus_name:?}");
+        };
+        assert_eq!(details.name.as_str(), ":1.42");
+    }
+
+    // `Serialize` writes a struct, which D-Bus takes as the sequence `visit_seq` reads but a
+    // self-describing format takes as a map. Both have to decode, or a `Subject` cannot be read
+    // back out of anything it was written to.
+    #[test]
+    fn subject_decodes_from_a_map_as_well_as_a_sequence() {
+        let subject = Subject::Other {
+            kind: "brand-new-kind".into(),
+            details: HashMap::from([(
+                "k".to_string(),
+                OwnedValue::try_from(Value::from("v")).unwrap(),
+            )]),
+        };
+
+        let json = serde_json::to_string(&subject).unwrap();
+        let Subject::Other { kind, details } = serde_json::from_str::<Subject>(&json).unwrap()
+        else {
+            panic!("decoded as something other than an unknown kind");
+        };
+
+        assert_eq!(kind, "brand-new-kind");
+        assert_eq!(*details["k"], Value::from("v"));
+    }
+
+    // A kind with no details set exercises the same dispatch for a variant this crate does know.
+    #[test]
+    fn subject_decodes_a_known_kind_from_a_map() {
+        let subject: Subject =
+            serde_json::from_str(r#"{"subject_kind":"unix-process","subject_details":{}}"#)
+                .unwrap();
+
+        let Subject::UnixProcess(details) = &subject else {
+            panic!("decoded as {subject:?}");
+        };
+        assert_eq!(details.pid, None);
+        assert_eq!(details.uid, None);
+    }
+
+    // A known kind's typed details go through zbus's `as_value` wrapper, which takes both the map
+    // a self-describing format writes and either input form, so these round-trip through a borrowed
+    // input (`from_str`) and an owned one (`serde_json::Value`) alike. It also proves the wrapper
+    // keeps integer widths: `pid` comes back the `u32` it left as, not the format's widest integer.
+    #[test]
+    #[ignore = "needs z-galaxy/zbus#1972, which teaches as_value::Deserialize to read a map"]
+    fn subject_round_trips_through_a_self_describing_format() {
+        let session = Subject::UnixSession(UnixSession {
+            session_id: "c2".into(),
+        });
+        for back in [
+            serde_json::from_str::<Subject>(&serde_json::to_string(&session).unwrap()).unwrap(),
+            serde_json::from_value::<Subject>(serde_json::to_value(&session).unwrap()).unwrap(),
+        ] {
+            let Subject::UnixSession(details) = back else {
+                panic!("decoded as another kind");
+            };
+            assert_eq!(details.session_id, "c2");
+        }
+
+        let process = Subject::new_for_pid(4242, Some(1_000_000), Some(1234)).unwrap();
+        for back in [
+            serde_json::from_str::<Subject>(&serde_json::to_string(&process).unwrap()).unwrap(),
+            serde_json::from_value::<Subject>(serde_json::to_value(&process).unwrap()).unwrap(),
+        ] {
+            let Subject::UnixProcess(details) = back else {
+                panic!("decoded as another kind");
+            };
+            assert_eq!(details.pid, Some(4242));
+            assert_eq!(details.start_time, Some(1_000_000));
+            assert_eq!(details.uid, Some(1234));
+            assert!(details.pidfd.is_none());
+        }
+
+        // And enclosed in something the derive handles, since that is how one usually arrives.
+        let authorization = TemporaryAuthorization {
+            id: "x".into(),
+            action_id: "a".into(),
+            subject: session,
+            time_obtained: 1,
+            time_expires: 2,
+        };
+        for back in [
+            serde_json::from_str::<TemporaryAuthorization>(
+                &serde_json::to_string(&authorization).unwrap(),
+            )
+            .unwrap(),
+            serde_json::from_value::<TemporaryAuthorization>(
+                serde_json::to_value(&authorization).unwrap(),
+            )
+            .unwrap(),
+        ] {
+            assert_eq!(back.id, "x");
+            assert!(matches!(back.subject, Subject::UnixSession(_)));
+        }
+    }
+
+    // The details can arrive before the kind: `serde_json::to_value` sorts keys, which puts them
+    // first. The kind is what says how to read them, so they are held until it turns up. An
+    // unknown kind's details are an `OwnedValue` map, whose signature still decodes only from a
+    // borrowed string, so this uses a borrowed `from_str` input; the same subject through
+    // `to_value`/`from_value` would fail on that, unlike the known kinds in the round-trip test.
+    #[test]
+    fn subject_decodes_its_details_before_its_kind() {
+        // What `serde_json::to_value(&Subject::Other { .. }).unwrap()` lays the keys out as.
+        let reversed = r#"{"subject_details":{"k":{"signature":"s","value":"v"}},"subject_kind":"brand-new-kind"}"#;
+
+        let Subject::Other { kind, details } = serde_json::from_str::<Subject>(reversed).unwrap()
+        else {
+            panic!("decoded as something other than an unknown kind");
+        };
+        assert_eq!(kind, "brand-new-kind");
+        assert_eq!(*details["k"], Value::from("v"));
+    }
+
+    #[test]
+    fn subject_keeps_a_kind_it_does_not_know_as_it_arrived() {
+        let subject = received_as("unix-netgroup", [("name", Value::from("engineering"))]);
+
+        let Subject::Other { kind, details } = &subject else {
+            panic!("expected an unknown kind to be kept, got {subject:?}");
+        };
+        assert_eq!(kind, "unix-netgroup");
+        assert_eq!(*details["name"], Value::from("engineering"));
     }
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn subject_for_owner_fails_for_a_missing_process() {
+    fn subject_for_pid_fails_for_a_missing_process() {
         // pid_max is capped at 2^22 on Linux, so this PID can never exist.
-        let err = Subject::new_for_owner(u32::MAX, None, None).unwrap_err();
+        let err = Subject::new_for_pid(u32::MAX, None, None).unwrap_err();
         assert!(matches!(err, Error::Io(_)), "{err:?}");
     }
 
@@ -536,18 +1105,15 @@ mod tests {
 
     #[test]
     fn start_time_rejects_malformed_stat() {
-        assert!(matches!(
-            parse_start_time(""),
-            Err(Error::MalformedProc("start-time"))
-        ));
+        assert!(matches!(parse_start_time(""), Err(Error::MalformedProc(_))));
         assert!(matches!(
             parse_start_time("no parens here"),
-            Err(Error::MalformedProc("start-time"))
+            Err(Error::MalformedProc(_))
         ));
         // Too few fields after `comm`.
         assert!(matches!(
             parse_start_time("1234 (x) S 1 1234"),
-            Err(Error::MalformedProc("start-time"))
+            Err(Error::MalformedProc(_))
         ));
         // Field 22 present but not a number.
         let stat = "1 (x) S 0 1 1 0 -1 4194560 100 0 0 0 5 3 0 0 20 0 1 0 forty-two 12345678 100";
@@ -571,15 +1137,12 @@ mod tests {
 
     #[test]
     fn uid_rejects_malformed_status() {
-        assert!(matches!(parse_uid(""), Err(Error::MalformedProc("uid"))));
+        assert!(matches!(parse_uid(""), Err(Error::MalformedProc(_))));
         assert!(matches!(
             parse_uid("Name:\tx\nGid:\t0\t0\t0\t0\n"),
-            Err(Error::MalformedProc("uid"))
+            Err(Error::MalformedProc(_))
         ));
-        assert!(matches!(
-            parse_uid("Uid:\n"),
-            Err(Error::MalformedProc("uid"))
-        ));
+        assert!(matches!(parse_uid("Uid:\n"), Err(Error::MalformedProc(_))));
         assert!(matches!(
             parse_uid("Uid:\tnobody\n"),
             Err(Error::ParseInt(_))
@@ -591,6 +1154,9 @@ mod tests {
     #[test]
     fn wire_signatures_match_polkit() {
         assert_eq!(Subject::SIGNATURE.to_string(), "(sa{sv})");
+        assert_eq!(UnixProcess::SIGNATURE.to_string(), "a{sv}");
+        assert_eq!(UnixSession::SIGNATURE.to_string(), "a{sv}");
+        assert_eq!(SystemBusName::SIGNATURE.to_string(), "a{sv}");
         assert_eq!(<Identity<'_>>::SIGNATURE.to_string(), "(sa{sv})");
         assert_eq!(
             TemporaryAuthorization::SIGNATURE.to_string(),
@@ -653,9 +1219,16 @@ mod tests {
 
         let subject = Subject::new_for_message_header(&msg.header()).unwrap();
 
-        assert_eq!(subject.subject_kind, "system-bus-name");
-        assert_eq!(subject.subject_details.len(), 1);
-        assert_eq!(*subject.subject_details["name"], Value::Str(":1.42".into()));
+        let Subject::SystemBusName(details) = &subject else {
+            panic!("expected a system-bus-name subject, got {subject:?}");
+        };
+        assert_eq!(details.name.as_str(), ":1.42");
+
+        let (kind, sent) = sent_as(&subject);
+
+        assert_eq!(kind, "system-bus-name");
+        assert_eq!(sent.len(), 1);
+        assert_eq!(*sent["name"], Value::Str(":1.42".into()));
     }
 
     #[test]
