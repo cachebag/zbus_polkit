@@ -33,16 +33,14 @@ pub async fn connect() -> (Connection, Connection) {
     );
     #[cfg(feature = "tokio")]
     let (server, client) = (
-        connection::Builder::unix_stream(server_stream),
-        connection::Builder::unix_stream(client_stream),
+        connection::Builder::tokio_unix_stream(server_stream),
+        connection::Builder::tokio_unix_stream(client_stream),
     );
 
     let server = server
         .server(Guid::generate())
-        .unwrap()
         .p2p()
         .serve_at(AUTHORITY_PATH, MockAuthority::default())
-        .unwrap()
         .build();
 
     // Both ends have to make progress for the peer-to-peer handshake to finish.
