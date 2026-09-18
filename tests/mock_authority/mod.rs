@@ -21,20 +21,12 @@ use zbus_polkit::policykit1::{
 ///
 /// The server has to outlive the client for the client to have anything to talk to.
 pub async fn connect() -> (Connection, Connection) {
-    #[cfg(not(feature = "tokio"))]
+    // `Builder::unix_stream` takes a std stream and drives it on whichever runtime the connection
+    // is built on, so the same pair works for both the async-io and tokio builds.
     let (server_stream, client_stream) = std::os::unix::net::UnixStream::pair().unwrap();
-    #[cfg(feature = "tokio")]
-    let (server_stream, client_stream) = tokio::net::UnixStream::pair().unwrap();
-
-    #[cfg(not(feature = "tokio"))]
     let (server, client) = (
-        connection::Builder::async_io_unix_stream(server_stream),
-        connection::Builder::async_io_unix_stream(client_stream),
-    );
-    #[cfg(feature = "tokio")]
-    let (server, client) = (
-        connection::Builder::tokio_unix_stream(server_stream),
-        connection::Builder::tokio_unix_stream(client_stream),
+        connection::Builder::unix_stream(server_stream),
+        connection::Builder::unix_stream(client_stream),
     );
 
     let server = server

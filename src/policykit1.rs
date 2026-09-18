@@ -999,7 +999,6 @@ mod tests {
     // input (`from_str`) and an owned one (`serde_json::Value`) alike. It also proves the wrapper
     // keeps integer widths: `pid` comes back the `u32` it left as, not the format's widest integer.
     #[test]
-    #[ignore = "needs z-galaxy/zbus#1972, which teaches as_value::Deserialize to read a map"]
     fn subject_round_trips_through_a_self_describing_format() {
         let session = Subject::UnixSession(UnixSession {
             session_id: "c2".into(),

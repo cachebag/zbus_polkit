@@ -70,24 +70,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "async-process"
-version = "2.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fc50921ec0055cdd8a16de48773bfeec5c972598674347252c0399676be7da75"
-dependencies = [
- "async-channel",
- "async-io",
- "async-lock",
- "async-signal",
- "async-task",
- "blocking",
- "cfg-if",
- "event-listener",
- "futures-lite",
- "rustix",
-]
-
-[[package]]
 name = "async-recursion"
 version = "1.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -96,24 +78,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
-]
-
-[[package]]
-name = "async-signal"
-version = "0.2.14"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "52b5aaafa020cf5053a01f2a60e8ff5dccf550f0f77ec54a4e47285ac2bab485"
-dependencies = [
- "async-io",
- "async-lock",
- "atomic-waker",
- "cfg-if",
- "futures-core",
- "futures-io",
- "rustix",
- "signal-hook-registry",
- "slab",
- "windows-sys",
 ]
 
 [[package]]
@@ -538,16 +502,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "signal-hook-registry"
-version = "1.4.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c4db69cba1110affc0e9f7bcd48bbf87b3f4fc7c61fc9155afd4c469eb3d6c1b"
-dependencies = [
- "errno",
- "libc",
-]
-
-[[package]]
 name = "slab"
 version = "0.4.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -614,7 +568,6 @@ dependencies = [
  "libc",
  "mio",
  "pin-project-lite",
- "signal-hook-registry",
  "socket2",
  "tokio-macros",
  "windows-sys",
@@ -738,13 +691,12 @@ dependencies = [
 [[package]]
 name = "zbus"
 version = "6.0.0"
-source = "git+https://github.com/z-galaxy/zbus#fd6bb69078aee95a3c5534b576851d462f1551f7"
+source = "git+https://github.com/z-galaxy/zbus#fd51524e4230be62aeb6886fa46fe0798cbe1421"
 dependencies = [
  "async-broadcast",
  "async-executor",
  "async-io",
  "async-lock",
- "async-process",
  "async-recursion",
  "async-task",
  "async-trait",
@@ -760,6 +712,7 @@ dependencies = [
  "rustix",
  "serde",
  "serde_repr",
+ "socket2",
  "tokio",
  "uds_windows",
  "uuid",
@@ -773,7 +726,7 @@ dependencies = [
 [[package]]
 name = "zbus_macros"
 version = "6.0.0"
-source = "git+https://github.com/z-galaxy/zbus#fd6bb69078aee95a3c5534b576851d462f1551f7"
+source = "git+https://github.com/z-galaxy/zbus#fd51524e4230be62aeb6886fa46fe0798cbe1421"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -800,7 +753,7 @@ dependencies = [
 [[package]]
 name = "zbus_utils"
 version = "6.0.0"
-source = "git+https://github.com/z-galaxy/zbus#fd6bb69078aee95a3c5534b576851d462f1551f7"
+source = "git+https://github.com/z-galaxy/zbus#fd51524e4230be62aeb6886fa46fe0798cbe1421"
 dependencies = [
  "proc-macro2",
  "quote",
