@@ -91,6 +91,17 @@ impl Subject {
         })))
     }
 
+    /// Create a `Subject` for `unix-session`.
+    ///
+    /// # Arguments
+    ///
+    /// * session_id - The session ID.
+    pub fn new_for_unix_session(session_id: impl Into<String>) -> Self {
+        Self(Kind::UnixSession(UnixSession {
+            session_id: session_id.into(),
+        }))
+    }
+
     /// Create a `Subject` for a message for querying if the sender of a Message is permitted to
     /// execute an action.
     ///
