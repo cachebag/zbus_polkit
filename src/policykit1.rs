@@ -6,6 +6,8 @@ use serde_repr::{Deserialize_repr, Serialize_repr};
 use static_assertions::assert_impl_all;
 use zbus::{fdo, Basic, OwnedVariant, Type, Variant};
 
+mod identity;
+pub use identity::OwnedIdentity;
 mod subject;
 pub use subject::Subject;
 
@@ -153,6 +155,9 @@ assert_impl_all!(TemporaryAuthorization: Send, Sync, Unpin);
 /// * Unix User. `identity_kind` should be set to `unix-user` with key uid (of type uint32).
 ///
 /// * Unix Group. `identity_kind` should be set to `unix-group` with key gid (of type uint32).
+///
+/// This type only encodes. [`OwnedIdentity`] is its owned counterpart, which decodes as well and
+/// has constructors for the kinds polkit documents.
 #[derive(Debug, Type, Serialize)]
 pub struct Identity<'a> {
     pub identity_kind: &'a str,
